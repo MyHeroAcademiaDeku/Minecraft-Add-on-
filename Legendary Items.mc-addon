@@ -1,0 +1,392 @@
+{
+  "format_version": "1.21.0",
+  "minecraft:recipe_shapeless": {
+    "description": {"identifier": "power:rope_of_wisdom_recipe"},
+    "tags": ["crafting_table"],
+    "ingredients": [{"item": "minecraft:book"}, {"item": "minecraft:amethyst_shard"}],
+    "result": {"item": "power:rope_of_wisdom"}
+  }
+}
+
+{
+  "format_version": "1.21.0",
+  "minecraft:recipe_shapeless": {
+    "description": {"identifier": "power:staff_of_power_recipe"},
+    "tags": ["crafting_table"],
+    "ingredients": [{"item": "minecraft:mace"}, {"item": "minecraft:amethyst_shard"}],
+    "result": {"item": "power:staff_of_power"}
+  }
+}
+
+import { world, system } from "@minecraft/server";
+
+const COOLDOWN_TICKS = 100;   // 5 seconds between uses (per item, per player)
+const LONG = 20000000;        // effectively "until removed"
+const MOB_TIMEOUT = 100;      // a mob that can't be found for 5 seconds is treated as despawned (players never time out)
+const DESPAWN_MSG = "§7A linked mob has despawned. Its power is gone.";
+const SLAVE_MSG = "§cYour slave has died. Your power disappears!";
+const MASTER_MSG = "§aYour Master has died. Be free!";
+const IGNORED_TARGETS = new Set(["minecraft:armor_stand"]);
+
+const lastUse = new Map();    // "playerId:itemId" -> tick
+const cache = new Map();      // id -> entity reference
+const applied = new Map();    // "kind:wielderId" -> signature of the bonus last applied
+
+// ---------- saved data (survives leaving the game and restarting the world) ----------
+// data.staff[wielderId] = { links: [{ id, stolen, isPlayer, missing }] }
+// data.rope[wielderId]  = { links: [{ id, stolen, isPlayer, missing }] }
+// data.pending[playerId] = [messages to show when they come back]
+let data = null;
+function D() {
+  if (!data) {
+    try {
+      const raw = world.getDynamicProperty("power_data");
+      data = typeof raw === "string" ? JSON.parse(raw) : null;
+    } catch { data = null; }
+    if (!data || typeof data !== "object") data = {};
+    data.staff ??= {}; data.rope ??= {}; data.pending ??= {};
+  }
+  return data;
+}
+function save() {
+  try { world.setDynamicProperty("power_data", JSON.stringify(D())); } catch {}
+}
+
+// ---------- helpers ----------
+function valid(e) {
+  try { return typeof e.isValid === "function" ? e.isValid() : !!e.isValid; } catch { return false; }
+}
+function alive(e) {
+  if (!valid(e)) return false;
+  try { const hp = e.getComponent("minecraft:health"); return !hp || hp.currentValue > 0; } catch { return false; }
+}
+// Find a loaded entity (online player or loaded mob) by id. Returns undefined if offline/unloaded.
+function find(id) {
+  const c = cache.get(id);
+  if (c && valid(c)) return c;
+  cache.delete(id);
+  let e;
+  try { if (typeof world.getEntity === "function") e = world.getEntity(id); } catch {}
+  if (e && !valid(e)) e = undefined;
+  if (!e && typeof world.getEntity !== "function") {
+    for (const p of world.getAllPlayers()) if (p.id === id) { e = p; break; }
+    if (!e) {
+      for (const d of ["overworld", "nether", "the_end"]) {
+        try { for (const x of world.getDimension(d).getEntities()) if (x.id === id) { e = x; break; } } catch {}
+        if (e) break;
+      }
+    }
+  }
+  if (e) cache.set(id, e);
+  return e;
+}
+function tell(entity, msg) {
+  try { if (entity && valid(entity) && typeof entity.sendMessage === "function") entity.sendMessage(msg); } catch {}
+}
+function tellOrQueue(id, msg) {
+  const e = find(id);
+  if (e && typeof e.sendMessage === "function") { tell(e, msg); return; }
+  (D().pending[id] ??= []).push(msg);
+}
+function onCooldown(player, itemId) {
+  const key = player.id + ":" + itemId;
+  const last = lastUse.get(key) ?? -Infinity;
+  if (system.currentTick - last < COOLDOWN_TICKS) return true;
+  lastUse.set(key, system.currentTick);
+  return false;
+}
+// Remove only the effect that belongs to this kind of link.
+function clearVictimEffect(kind, victim) {
+  try { victim.removeEffect(kind === "staff" ? "slowness" : "weakness"); } catch {}
+}
+// Remove first, then add, so a weaker effect really replaces a stronger one.
+function setEffect(p, name, amplifier) {
+  try { p.removeEffect(name); } catch {}
+  p.addEffect(name, LONG, { amplifier: Math.max(0, Math.min(255, amplifier)), showParticles: false });
+}
+
+// ---------- wielder bonuses ----------
+function applyBonus(kind, wid) {
+  const st = D()[kind][wid];
+  const p = find(wid);
+  if (!p || !valid(p)) return; // offline: re-applied when they return
+  const key = kind + ":" + wid;
+  if (kind === "staff") {
+    if (!st || st.links.length === 0) {
+      p.removeEffect("health_boost"); p.removeEffect("speed"); applied.delete(key); return;
+    }
+    const total = st.links.reduce((s, l) => s + (l.stolen || 0), 0);
+    const levels = total > 0 ? Math.ceil(total / 4) : 0; // each level = +2 hearts
+    const sig = String(levels);
+    if (levels === 0) {
+      if (p.getEffect("health_boost")) p.removeEffect("health_boost");
+    } else if (applied.get(key) !== sig || !p.getEffect("health_boost")) {
+      setEffect(p, "health_boost", levels - 1);
+    }
+    applied.set(key, sig);
+    if (!p.getEffect("speed")) p.addEffect("speed", LONG, { amplifier: 1, showParticles: false });
+  } else {
+    if (!st || st.links.length === 0) {
+      p.removeEffect("absorption"); p.removeEffect("resistance"); applied.delete(key); return;
+    }
+    const n = st.links.length;
+    const sig = String(n);
+    if (applied.get(key) !== sig || !p.getEffect("resistance")) {
+      setEffect(p, "absorption", Math.min(3 + n, 19));
+      setEffect(p, "resistance", Math.min(n, 3));
+      applied.set(key, sig);
+    }
+  }
+}
+
+function refreshVictim(kind, victim) {
+  if (kind === "staff") {
+    victim.addEffect("slowness", 100, { amplifier: 3, showParticles: true });
+  } else {
+    for (const e of ["absorption", "resistance"]) { if (victim.getEffect(e)) victim.removeEffect(e); }
+    victim.addEffect("weakness", 100, { amplifier: 0, showParticles: true });
+  }
+}
+
+// ---------- item abilities ----------
+function link(kind, player, target, stolen) {
+  const st = (D()[kind][player.id] ??= { links: [] });
+  let l = st.links.find((x) => x.id === target.id);
+  if (!l) { l = { id: target.id, stolen: 0, isPlayer: target.typeId === "minecraft:player", missing: null }; st.links.push(l); }
+  l.stolen += stolen;
+  l.missing = null;
+  cache.set(target.id, target);
+  save();
+}
+
+function staffOfPower(player, target) {
+  const hp = target.getComponent("minecraft:health");
+  if (!hp || hp.currentValue <= 0) return;
+  const stolen = Math.max(0, hp.currentValue - 2); // leave 1 heart
+  hp.setCurrentValue(Math.min(2, hp.currentValue));
+  link("staff", player, target, stolen);
+  refreshVictim("staff", target);
+  applyBonus("staff", player.id);
+  player.sendMessage("§5The Staff of Power drains your foe!");
+  if (stolen > 0) {
+    // Health Boost raises max health a moment later, so heal after it has taken effect.
+    system.runTimeout(() => {
+      if (!alive(player)) return;
+      const myHp = player.getComponent("minecraft:health");
+      if (myHp) myHp.setCurrentValue(Math.min(myHp.effectiveMax, myHp.currentValue + stolen));
+    }, 2);
+  }
+}
+
+function ropeOfWisdom(player, target) {
+  link("rope", player, target, 0);
+  refreshVictim("rope", target);
+  applied.delete("rope:" + player.id); // using the Rope again recharges the shield
+  applyBonus("rope", player.id);
+  player.sendMessage("§bThe Rope of Wisdom shields you!");
+}
+
+world.afterEvents.entityHitEntity.subscribe((ev) => {
+  const player = ev.damagingEntity;
+  const target = ev.hitEntity;
+  if (player.typeId !== "minecraft:player") return;
+  if (!valid(target) || target.id === player.id || IGNORED_TARGETS.has(target.typeId)) return;
+  if (!alive(target)) return; // the hit already killed it
+  const item = player.getComponent("minecraft:inventory")?.container?.getItem(player.selectedSlotIndex);
+  if (!item) return;
+  if (item.typeId === "power:staff_of_power") {
+    if (onCooldown(player, item.typeId)) return;
+    staffOfPower(player, target);
+  } else if (item.typeId === "power:rope_of_wisdom") {
+    if (onCooldown(player, item.typeId)) return;
+    ropeOfWisdom(player, target);
+  }
+});
+
+// ---------- death handling ----------
+function handleDeath(deadId) {
+  let changed = false;
+  for (const kind of ["staff", "rope"]) {
+    const all = D()[kind];
+    // The dead one was a wielder: every victim is freed.
+    if (all[deadId]) {
+      for (const l of all[deadId].links) {
+        const v = find(l.id);
+        if (v) clearVictimEffect(kind, v);
+        if (l.isPlayer) tellOrQueue(l.id, MASTER_MSG);
+      }
+      delete all[deadId];
+      applied.delete(kind + ":" + deadId);
+      changed = true;
+    }
+    // The dead one was a victim: that wielder loses its share of the power.
+    for (const wid of Object.keys(all)) {
+      const st = all[wid];
+      if (!st) continue;
+      const l = st.links.find((x) => x.id === deadId);
+      if (!l) continue;
+      st.links = st.links.filter((x) => x !== l);
+      tellOrQueue(wid, SLAVE_MSG);
+      if (st.links.length === 0) delete all[wid];
+      applyBonus(kind, wid);
+      changed = true;
+    }
+  }
+  if (changed) save();
+}
+
+world.afterEvents.entityDie.subscribe((ev) => {
+  let id;
+  try { id = ev.deadEntity.id; } catch { return; }
+  handleDeath(id);
+});
+
+// ---------- coming back to the game ----------
+world.afterEvents.playerSpawn.subscribe((ev) => {
+  if (!ev.initialSpawn) return;
+  const player = ev.player;
+  const id = player.id;
+  cache.set(id, player);
+  system.runTimeout(() => {
+    if (!valid(player)) return;
+    const msgs = D().pending[id];
+    if (msgs) {
+      for (const m of msgs) tell(player, m);
+      // their Master died while they were away: shake off any leftover drain (re-applied below if still linked)
+      if (msgs.includes(MASTER_MSG)) { clearVictimEffect("staff", player); clearVictimEffect("rope", player); }
+      delete D().pending[id]; save();
+    }
+    applyBonus("staff", id); applyBonus("rope", id);
+    // if they are someone's victim, put the effect back right away
+    for (const kind of ["staff", "rope"]) {
+      for (const st of Object.values(D()[kind])) {
+        if (st && st.links.some((l) => l.id === id) && alive(player)) refreshVictim(kind, player);
+      }
+    }
+  }, 40);
+});
+
+// ---------- upkeep every second ----------
+system.runInterval(() => {
+  let changed = false;
+  for (const kind of ["staff", "rope"]) {
+    const all = D()[kind];
+    for (const wid of Object.keys(all)) {
+      const st = all[wid];
+      if (!st) continue; // removed earlier this pass by a death
+      const wielder = find(wid);
+      if (wielder && valid(wielder) && !alive(wielder)) { handleDeath(wid); continue; }
+      for (const l of [...st.links]) {
+        const victim = find(l.id);
+        if (victim) {
+          if (!alive(victim)) { handleDeath(l.id); break; }
+          l.missing = null;
+          refreshVictim(kind, victim);
+        } else if (!l.isPlayer) {
+          // a mob we can't find: a few seconds of grace, then treat it as despawned and break the link
+          if (l.missing == null) { l.missing = system.currentTick; changed = true; }
+          else if (system.currentTick - l.missing > MOB_TIMEOUT) {
+            st.links = st.links.filter((x) => x !== l);
+            tellOrQueue(wid, DESPAWN_MSG);
+            changed = true;
+          }
+        }
+        // offline PLAYER: the link simply waits for them to return
+      }
+      if (all[wid]) {
+        if (st.links.length === 0) { delete all[wid]; changed = true; }
+        applyBonus(kind, wid);
+      }
+    }
+  }
+  if (changed) save();
+}, 20);
+
+{
+  "format_version": "1.21.0",
+  "minecraft:item": {
+    "description": {
+      "identifier": "power:rope_of_wisdom",
+      "menu_category": {"category": "equipment", "group": "itemGroup.name.sword"}
+    },
+    "components": {
+      "minecraft:icon": {"textures": {"default": "rope_of_wisdom"}},
+      "minecraft:display_name": {"value": "Rope of Wisdom"},
+      "minecraft:max_stack_size": 1,
+      "minecraft:hand_equipped": true,
+      "minecraft:enchantable": {"value": 10, "slot": "sword"}
+    }
+  }
+}
+
+{
+  "format_version": "1.21.0",
+  "minecraft:item": {
+    "description": {
+      "identifier": "power:staff_of_power",
+      "menu_category": {"category": "equipment", "group": "itemGroup.name.sword"}
+    },
+    "components": {
+      "minecraft:icon": {"textures": {"default": "staff_of_power"}},
+      "minecraft:display_name": {"value": "Staff of Power"},
+      "minecraft:max_stack_size": 1,
+      "minecraft:hand_equipped": true,
+      "minecraft:enchantable": {"value": 10, "slot": "sword"}
+    }
+  }
+}
+
+{
+  "format_version": 2,
+  "header": {
+    "name": "Power Items BP",
+    "description": "Staff of Power and Rope of Wisdom",
+    "uuid": "a1f3c2d4-5b6e-4f70-8a91-0b2c3d4e5f60",
+    "version": [
+      1,
+      0,
+      6
+    ],
+    "min_engine_version": [
+      1,
+      21,
+      0
+    ]
+  },
+  "modules": [
+    {
+      "type": "data",
+      "uuid": "b2a4d3e5-6c7f-4081-9ba2-1c3d4e5f6071",
+      "version": [
+        1,
+        0,
+        0
+      ]
+    },
+    {
+      "type": "script",
+      "language": "javascript",
+      "uuid": "c3b5e4f6-7d80-4192-8cb3-2d4e5f607182",
+      "version": [
+        1,
+        0,
+        0
+      ],
+      "entry": "scripts/main.js"
+    }
+  ],
+  "dependencies": [
+    {
+      "uuid": "d4c6f507-8e91-42a3-9dc4-3e5f60718293",
+      "version": [
+        1,
+        0,
+        6
+      ]
+    },
+    {
+      "module_name": "@minecraft/server",
+      "version": "1.11.0"
+    }
+  ]
+}
