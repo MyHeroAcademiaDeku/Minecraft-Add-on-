@@ -1,0 +1,42 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "Power Items RP",
+    "description": "Textures for Staff of Power and Rope of Wisdom",
+    "uuid": "d4c6f507-8e91-42a3-9dc4-3e5f60718293",
+    "version": [
+      1,
+      0,
+      6
+    ],
+    "min_engine_version": [
+      1,
+      21,
+      0
+    ]
+  },
+  "modules": [
+    {
+      "type": "resources",
+      "uuid": "e5d70618-9fa2-43b4-8ad5-4f6071829304",
+      "version": [
+        1,
+        0,
+        0
+      ]
+    }
+  ]
+}
+item.power:staff_of_power=Staff of Power
+item.power:rope_of_wisdom=Rope of Wisdom
+
+["en_US"]
+
+{
+  "resource_pack_name": "power_items",
+  "texture_name": "atlas.items",
+  "texture_data": {
+    "staff_of_power": {"textures": "textures/items/staff_of_power"},
+    "rope_of_wisdom": {"textures": "textures/items/rope_of_wisdom"}
+  }
+}
